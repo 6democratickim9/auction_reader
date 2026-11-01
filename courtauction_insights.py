@@ -36,9 +36,9 @@ OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
 RESULT_COLUMNS = [
     "소재지", "법원", "사건번호", "물건번호", "매각기일", "물건용도",
     "면적_㎡", "면적_평", "면적기준", "유찰횟수",
-    "감정가_원", "최저매각가_원", "매각가율_%", "할인율_%",
+    "감정가_원", "최저매각가_원", "매각가율_%", "할인율_%", "지분매각", "매각지분",
 ]
-EXPORT_COLUMNS = RESULT_COLUMNS + [
+EXPORT_COLUMNS = RESULT_COLUMNS + ["매각지분_원문", "지분판단_근거",
     "시도", "주소_도로명", "주소_지번", "면적출처", "물건비고", "물건설명",
     "상태코드", "전체소유권_확정여부", "권리인수_검토", "saNo",
 ]
@@ -174,6 +174,19 @@ def addresses(item: dict) -> tuple[str, str, str, str]:
     return addr, road, lot, sido
 
 
+def share_info(item):
+    """Preserve sale-share evidence; absence is not proof of full ownership."""
+    raw = clean(item.get("maejibun")) or clean(item.get("매각지분_원문"))
+    note = first(item, "mulBigo", "dspslGdsRmk", "bigo", "물건비고")
+    source = raw + " " + note
+    fractions = re.findall(r"[\d,]+(?:\.\d+)?\s*분의\s*[\d,]+(?:\.\d+)?", raw)
+    explicit = re.search(r"(?:공유)?지분\s*매각", source)
+    negated = re.search(r"지분\s*매각\s*(?:아님|아니|이\s*아님)", source)
+    status = "지분매각 표기" if fractions or (explicit and not negated) else "미확인"
+    return {"지분매각": status, "매각지분": " · ".join(dict.fromkeys(fractions)) or "비율 미확인",
+            "매각지분_원문": raw, "지분판단_근거": " | ".join(x for x in (raw, note if explicit else "") if x)}
+
+
 def parse_record(item: dict) -> dict:
     addr, road, lot, sido = addresses(item)
     disp_case = first(item, "srnSaNo", "printCsNo")
@@ -189,6 +202,7 @@ def parse_record(item: dict) -> dict:
     if re.fullmatch(r"\d{8}", date):
         date = f"{date[:4]}-{date[4:6]}-{date[6:]}"
     return {
+        **share_info(item),
         "소재지": addr, "주소_도로명": road, "주소_지번": lot, "시도": sido,
         "법원": first(item, "jiwonNm") or first(item, "printCsNo").split(" ")[0],
         "사건번호": case, "물건번호": first(item, "maemulSer", "mokmulSer"),
@@ -397,6 +411,7 @@ def upload_files(paths) -> tuple[dict, str]:
                             if a and m is not None:
                                 normalized["매각가율_%"] = round(m / a * 100, 1)
                                 normalized["할인율_%"] = round(100 - m / a * 100, 1)
+                            normalized.update(share_info(item))
                             rows.append(normalized)
                         else:
                             rows.append(parse_record(item))
@@ -543,6 +558,9 @@ def select_detail(rows: list[dict], key: str) -> str:
     area_label = f"{area:g}㎡ ({area / 3.305785:.1f}평)" if area is not None else "미확인"
     return (f"### {v('사건번호')} · 물건 {v('물건번호')}\n\n"
             f"**소재지:** {v('소재지')}\n\n"
+            f"**지분매각:** {v('지분매각')} / **매각지분:** {v('매각지분')}\n\n"
+            f"**지분 원문:** {v('매각지분_원문')}\n\n"
+            f"**지분 판단 근거:** {v('지분판단_근거')}\n\n"
             f"**면적:** {area_label} / **기준:** {v('면적기준')}\n\n"
             f"**최저매각가:** {fmt_money(row.get('최저매각가_원'))} / "
             f"**감정가:** {fmt_money(row.get('감정가_원'))}\n\n"
@@ -877,6 +895,9 @@ def insights(rows, key, kakao_key, molit_key, manual_code, apt_name, months,
     candidates, strict, msg = comparable_rows(trades, dong, apt_name or "", area, verified_area)
     parts.append(f"**비교 판정:** {msg}")
     min_price = numeric(row.get("최저매각가_원"))
+    if row.get("지분매각") == "지분매각 표기":
+        strict = []
+        parts.append("**지분매각 표기 물건**입니다. 매각지분: " + clean(row.get("매각지분")) + ". 전체 아파트 실거래가와의 가격차 계산은 생략합니다.")
     if strict:
         prices = [r["거래금액_원"] for r in strict]
         median_price = int(statistics.median(prices))
@@ -909,6 +930,7 @@ def result_dashboard(rows, data):
     notice = '<p class="partial-note">일부 데이터만 조회되었습니다. 아래 목록은 전체 검색 결과가 아닙니다.</p>' if partial else ''
     cards = []
     for i, r in enumerate(rows, 1):
+        ownership = f"{esc(r.get('지분매각') or '미확인')} · {esc(r.get('매각지분') or '비율 미확인')}"
         price = numeric(r.get("최저매각가_원"))
         money = fmt_money(price)
         discount = decimal_number(r.get("할인율_%"))
@@ -917,7 +939,7 @@ def result_dashboard(rows, data):
         area_text = f"{area:g}㎡" if area is not None else "면적 미확인"
         cards.append(f'<article class="property-card"><div class="card-top"><span>#{i:02d} · {esc(r.get("물건용도"))}</span><span class="discount">{badge}</span></div>'
                      f'<h3>{esc(r.get("소재지"))}</h3><p class="case">{esc(r.get("사건번호"))} · 물건 {esc(r.get("물건번호"))}</p>'
-                     f'<div class="price-label">최저매각가</div><div class="price">{money}</div>'
+                     f'<p class="partial-note">지분: {ownership}</p><div class="price-label">최저매각가</div><div class="price">{money}</div>'
                      f'<div class="card-facts"><span>{area_text} · {esc(r.get("면적기준"))}</span><span>유찰 {esc(r.get("유찰횟수"))}회</span></div>'
                      f'<div class="card-bottom"><span>매각 {esc(r.get("매각기일"))}</span><button type="button" data-property-index="{i - 1}">상세조회 →</button></div></article>')
     return stats + notice + '<div class="result-heading"><h2>경매 물건</h2><span>상세조회로 지도와 실거래가를 바로 확인하세요</span></div><div class="property-grid">' + ''.join(cards) + '</div>'
@@ -979,42 +1001,43 @@ def refresh_insights(*args):
 
 
 APP_CSS = """
-.gradio-container {max-width: 1480px !important; margin:auto; background:#f5f7fa;}
+.gradio-container {max-width: 1480px !important; margin:auto; background:var(--body-background-fill);}
 #hero {padding:22px 26px; border-radius:16px; background:#112f35; color:white; margin-bottom:6px;}
 #hero h1 {color:white; font-size:28px; letter-spacing:-1px; margin:6px 0;}
 #hero p {color:#c7dcdf; margin:0; font-size:14px;}
 #hero .eyebrow {color:#80d9bd; font-size:11px; letter-spacing:2px; font-weight:700;}
-#status {padding:14px 18px; border-left:4px solid #147d68; background:#edf6f3; border-radius:8px; color:#123e34;}
-#filter-panel {padding:18px; border:1px solid #dce3e8; border-radius:16px; background:white;}
+#status {padding:14px 18px; border-left:4px solid #147d68; background:var(--block-background-fill); border-radius:8px; color:var(--body-text-color);}
+#filter-panel {padding:18px; border:1px solid var(--border-color-primary); border-radius:16px; background:var(--block-background-fill);}
 #summary {padding:0; background:transparent; border:0;}
 .metrics {display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:24px;}
-.metrics>div {background:white;border:1px solid #dde4e9;border-radius:14px;padding:18px 22px;}
-.metrics span {display:block;color:#586979;font-size:13px;}
-.metrics strong {display:block;color:#133b37;font-size:30px;margin-top:8px;}
+.metrics>div {background:var(--block-background-fill);border:1px solid var(--border-color-primary);border-radius:14px;padding:18px 22px;}
+.metrics span {display:block;color:var(--body-text-color-subdued);font-size:13px;}
+.metrics strong {display:block;color:var(--body-text-color);font-size:30px;margin-top:8px;}
 .result-heading {display:flex;align-items:center;justify-content:space-between;gap:12px;margin:0 0 14px;}
-.result-heading h2 {font-size:20px;margin:0;color:#172e3e;}
-.result-heading>span {font-size:12px;color:#667586;}
+.result-heading h2 {font-size:20px;margin:0;color:var(--body-text-color);}
+.result-heading>span {font-size:12px;color:var(--body-text-color-subdued);}
 .property-grid {display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;max-height:790px;overflow:auto;padding:2px 4px 8px 0;}
-.property-card {background:white;border:1px solid #dde4e9;border-radius:15px;padding:22px;transition:box-shadow .15s;}
+.property-card {background:var(--block-background-fill);border:1px solid var(--border-color-primary);border-radius:15px;padding:22px;transition:box-shadow .15s;}
 .property-card:hover {box-shadow:0 6px 22px #163b3912;border-color:#80b7a9;}
-.card-top {display:flex;justify-content:space-between;align-items:center;gap:8px;font-size:12px;color:#566579;}
-.discount {background:#e8f5ef;color:#096448;border-radius:5px;padding:5px 7px;font-weight:700;}
-.property-card h3 {font-size:17px;line-height:1.6;min-height:54px;margin:16px 0 4px;color:#182e40;word-break:keep-all;overflow-wrap:anywhere;}
-.case {color:#718093;font-size:12px;margin:0 0 18px;}
-.price-label {color:#697786;font-size:12px;}
-.price {font-size:clamp(20px, 2.3vw, 29px);overflow-wrap:anywhere;font-weight:750;color:#123e36;margin:4px 0 14px;}
+.card-top {display:flex;justify-content:space-between;align-items:center;gap:8px;font-size:12px;color:var(--body-text-color-subdued);}
+.discount {background:var(--background-fill-secondary);color:var(--body-text-color);border-radius:5px;padding:5px 7px;font-weight:700;}
+.property-card h3 {font-size:17px;line-height:1.6;min-height:54px;margin:16px 0 4px;color:var(--body-text-color);word-break:keep-all;overflow-wrap:anywhere;}
+.case {color:var(--body-text-color-subdued);font-size:12px;margin:0 0 18px;}
+.price-label {color:var(--body-text-color-subdued);font-size:12px;}
+.price {font-size:clamp(20px, 2.3vw, 29px);overflow-wrap:anywhere;font-weight:750;color:var(--body-text-color);margin:4px 0 14px;}
 .price small {font-size:15px;font-weight:500;margin-left:5px;}
-.card-facts {display:flex;justify-content:space-between;color:#526273;font-size:12px;gap:8px;}
-.card-bottom {display:flex;justify-content:space-between;border-top:1px solid #edf0f3;margin-top:18px;padding-top:14px;font-size:12px;color:#647184;}
-.card-bottom button {cursor:pointer;background:transparent;border:0;color:#126952;text-decoration:none;font-weight:700;}
-.empty-state {text-align:center;background:white;border:1px dashed #c8d6dc;border-radius:16px;padding:60px 20px;color:#627282;}
-.empty-state>span {font-size:48px;color:#23856e;}.empty-state h2{font-size:22px;color:#234638;}.empty-state p{line-height:1.8;}
-.partial-note {background:#fff3dc;color:#80520f;border:1px solid #f0d296;border-radius:10px;padding:14px;margin-bottom:16px;}
-#detail {padding:20px;background:white;border:1px solid #dce3e8;border-radius:14px;scroll-margin-top:20px;}
+.card-facts {display:flex;justify-content:space-between;color:var(--body-text-color-subdued);font-size:12px;gap:8px;}
+.card-bottom {display:flex;justify-content:space-between;border-top:1px solid var(--border-color-primary);margin-top:18px;padding-top:14px;font-size:12px;color:var(--body-text-color-subdued);}
+.card-bottom button {cursor:pointer;background:transparent;border:0;color:var(--link-text-color);text-decoration:none;font-weight:700;}
+.empty-state {text-align:center;background:var(--block-background-fill);border:1px dashed var(--border-color-primary);border-radius:16px;padding:60px 20px;color:var(--body-text-color-subdued);}
+.empty-state>span {font-size:48px;color:var(--link-text-color);}.empty-state h2{font-size:22px;color:var(--body-text-color);}.empty-state p{line-height:1.8;}
+.partial-note {background:var(--background-fill-secondary);color:var(--body-text-color);border:1px solid var(--border-color-primary);border-radius:10px;padding:14px;margin-bottom:16px;}
+#detail {padding:20px;background:var(--block-background-fill);border:1px solid var(--border-color-primary);border-radius:14px;scroll-margin-top:20px;}
 #results-table table {min-width:1200px;}
 @media(max-width:900px){.property-grid{grid-template-columns:1fr;}.metrics>div{padding:14px;}.metrics strong{font-size:24px;}}
 @media(max-width:600px){.gradio-container{padding:12px!important;}#hero{padding:20px;}#hero h1{font-size:23px;}.metrics{gap:6px;}.metrics>div{padding:12px 8px;}.result-heading{display:block;}}
 """
+
 
 
 def ui_options():

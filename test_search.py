@@ -111,5 +111,18 @@ class FullSearchTests(unittest.TestCase):
         self.assertEqual(len(controls),1)
         self.assertTrue(controls[0]['props']['multiselect'])
 
+class ShareTests(unittest.TestCase):
+    def test_fraction_and_entire_share_are_not_full_ownership(self):
+        row = app.parse_record({'maejibun':'지분 1345.8분의 281.23 전부'})
+        self.assertEqual(row['지분매각'], '지분매각 표기')
+        self.assertEqual(row['매각지분'], '1345.8분의 281.23')
+        self.assertIn('전부', row['매각지분_원문'])
+
+    def test_note_without_fraction_and_missing_evidence(self):
+        self.assertEqual(app.share_info({'mulBigo':'지분매각'})['지분매각'], '지분매각 표기')
+        self.assertEqual(app.share_info({})['지분매각'], '미확인')
+        self.assertEqual(app.share_info({'mulBigo':'지분매각 아님'})['지분매각'], '미확인')
+        self.assertEqual(app.share_info({'convAddr':'대지권 100분의 1'})['지분매각'], '미확인')
+
 if __name__ == '__main__':
     unittest.main()
